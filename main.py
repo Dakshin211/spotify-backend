@@ -12,7 +12,7 @@ app = FastAPI()
 # ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict later to frontend domain
+    allow_origins=["*"],  # restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,6 +36,7 @@ ydl_opts = {
 
 BAD = ["live", "remix", "cover", "karaoke", "slowed", "reverb", "short"]
 
+# ---------- Utils ----------
 def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
@@ -61,14 +62,12 @@ def best_youtube(title, artist, target_duration):
         if any(x in yt_title for x in BAD):
             continue
 
-        score = 0
-        score += similarity(title, yt_title) * 40
+        score = similarity(title, yt_title) * 40
 
         if artist.lower() in yt_title:
             score += 25
         if artist.lower() in channel:
             score += 20
-
         if "topic" in channel or "vevo" in channel:
             score += 15
 
@@ -102,38 +101,80 @@ def best_youtube(title, artist, target_duration):
         "thumbnail": f"https://i.ytimg.com/vi/{best['id']}/hqdefault.jpg"
     }
 
-# ---------- API ----------
+# ---------- Models ----------
 class ImportReq(BaseModel):
     playlistUrl: str
-    limit: int | None = None   # optional max songs
+    limit: int | None = None
 
-@app.post("/import-spotify")
-def import_playlist(data: ImportReq):
+# =========================================================
+# 1️⃣ PREVIEW SPOTIFY PLAYLIST (FAST)
+# =========================================================
+@app.post("/preview-spotify")
+def preview_spotify(data: ImportReq):
     playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
 
-    # --- Fetch playlist metadata ---
+    playlist = sp.playlist(playlist_id)
+
+    name = playlist["name"]
+    owner = playlist["owner"]["display_name"]
+    total_tracks = playlist["tracks"]["total"]
+
+    # Calculate total duration
+    total_duration_ms = 0
+    offset = 0
+    batch = 100
+
+    while True:
+        resp = sp.playlist_items(playlist_id, limit=batch, offset=offset)
+        items = resp["items"]
+        if not items:
+            break
+
+        for item in items:
+            track = item["track"]
+            if track:
+                total_duration_ms += track["duration_ms"]
+
+        offset += batch
+
+    total_minutes = total_duration_ms // 60000
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+
+    return {
+        "playlist": {
+            "id": playlist_id,
+            "name": name,
+            "owner": owner,
+            "total_tracks": total_tracks,
+            "duration": f"{hours} hr {minutes} min"
+        }
+    }
+
+# =========================================================
+# 2️⃣ IMPORT SPOTIFY PLAYLIST (HEAVY)
+# =========================================================
+@app.post("/import-spotify")
+def import_spotify(data: ImportReq):
+    playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
+
     playlist_meta = sp.playlist(playlist_id)
     playlist_name = playlist_meta["name"]
     total_tracks = playlist_meta["tracks"]["total"]
 
-    # --- Fetch all tracks (pagination) ---
+    # Fetch all tracks (pagination)
     tracks = []
     offset = 0
     batch = 50
 
     while True:
-        resp = sp.playlist_items(
-            playlist_id,
-            limit=batch,
-            offset=offset
-        )
+        resp = sp.playlist_items(playlist_id, limit=batch, offset=offset)
         items = resp["items"]
         if not items:
             break
         tracks.extend(items)
         offset += batch
 
-    # --- Apply optional limit ---
     if data.limit:
         tracks = tracks[:data.limit]
 
@@ -141,14 +182,14 @@ def import_playlist(data: ImportReq):
     processed = 0
 
     for item in tracks:
-        t = item["track"]
-        if not t:
+        track = item["track"]
+        if not track:
             continue
 
         yt = best_youtube(
-            t["name"],
-            t["artists"][0]["name"],
-            t["duration_ms"] // 1000
+            track["name"],
+            track["artists"][0]["name"],
+            track["duration_ms"] // 1000
         )
 
         processed += 1
