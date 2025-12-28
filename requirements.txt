@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+spotipy
+yt-dlp
+python-dotenv
