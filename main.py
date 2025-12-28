@@ -9,10 +9,10 @@ import os
 
 app = FastAPI()
 
-# ---------- CORS (IMPORTANT) ----------
+# ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # later restrict to your frontend domain
+    allow_origins=["*"],  # restrict later to frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,7 +39,7 @@ BAD = ["live", "remix", "cover", "karaoke", "slowed", "reverb", "short"]
 def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def best_youtube(title, artist, target_duration=None):
+def best_youtube(title, artist, target_duration):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         search = ydl.extract_info(
             f"ytsearch10:{title} {artist}",
@@ -72,17 +72,16 @@ def best_youtube(title, artist, target_duration=None):
         if "topic" in channel or "vevo" in channel:
             score += 15
 
-        if target_duration and duration:
-            diff = abs(duration - target_duration)
-            if diff < 3:
-                score += 15
-            elif diff < 7:
-                score += 10
-            elif diff < 12:
-                score += 5
+        diff = abs(duration - target_duration)
+        if diff < 3:
+            score += 15
+        elif diff < 7:
+            score += 10
+        elif diff < 12:
+            score += 5
 
         if views > 0:
-            score += min(15, (views ** 0.25))
+            score += min(15, views ** 0.25)
 
         if score > best_score:
             best = e
@@ -106,21 +105,62 @@ def best_youtube(title, artist, target_duration=None):
 # ---------- API ----------
 class ImportReq(BaseModel):
     playlistUrl: str
+    limit: int | None = None   # optional max songs
 
 @app.post("/import-spotify")
 def import_playlist(data: ImportReq):
     playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-    tracks = sp.playlist_items(playlist_id, limit=50)["items"]
+
+    # --- Fetch playlist metadata ---
+    playlist_meta = sp.playlist(playlist_id)
+    playlist_name = playlist_meta["name"]
+    total_tracks = playlist_meta["tracks"]["total"]
+
+    # --- Fetch all tracks (pagination) ---
+    tracks = []
+    offset = 0
+    batch = 50
+
+    while True:
+        resp = sp.playlist_items(
+            playlist_id,
+            limit=batch,
+            offset=offset
+        )
+        items = resp["items"]
+        if not items:
+            break
+        tracks.extend(items)
+        offset += batch
+
+    # --- Apply optional limit ---
+    if data.limit:
+        tracks = tracks[:data.limit]
 
     songs = []
+    processed = 0
+
     for item in tracks:
         t = item["track"]
+        if not t:
+            continue
+
         yt = best_youtube(
             t["name"],
             t["artists"][0]["name"],
             t["duration_ms"] // 1000
         )
+
+        processed += 1
         if yt:
             songs.append(yt)
 
-    return {"songs": songs}
+    return {
+        "playlist": {
+            "id": playlist_id,
+            "name": playlist_name,
+            "total_tracks": total_tracks
+        },
+        "processed": processed,
+        "songs": songs
+    }
