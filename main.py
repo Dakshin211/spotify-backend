@@ -6,13 +6,14 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from difflib import SequenceMatcher
 import os
+import re
 
 app = FastAPI()
 
 # ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,16 +35,29 @@ ydl_opts = {
     "ignoreerrors": True
 }
 
-BAD = ["live", "remix", "cover", "karaoke", "slowed", "reverb", "short"]
+BAD_KEYWORDS = [
+    "live", "remix", "cover", "karaoke", "slowed",
+    "reverb", "short", "instrumental", "8d", "nightcore"
+]
+
+TRUSTED_CHANNEL_HINTS = ["topic", "vevo", "official"]
 
 # ---------- Utils ----------
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\(.*?\)|\[.*?\]", "", text)
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 def similarity(a, b):
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
 
 def best_youtube(title, artist, target_duration):
+    query = f"{title} {artist}"
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         search = ydl.extract_info(
-            f"ytsearch10:{title} {artist}",
+            f"ytsearch12:{query}",
             download=False
         )
 
@@ -54,42 +68,59 @@ def best_youtube(title, artist, target_duration):
         if not e:
             continue
 
-        yt_title = (e.get("title") or "").lower()
-        channel = (e.get("uploader") or "").lower()
+        yt_title = e.get("title") or ""
+        channel = e.get("uploader") or ""
         duration = e.get("duration") or 0
         views = e.get("view_count") or 0
 
-        if any(x in yt_title for x in BAD):
+        yt_title_l = yt_title.lower()
+        channel_l = channel.lower()
+
+        # ❌ Hard reject junk
+        if any(bad in yt_title_l for bad in BAD_KEYWORDS):
             continue
 
-        score = similarity(title, yt_title) * 40
+        score = 0
 
-        if artist.lower() in yt_title:
+        # 1️⃣ Title similarity (MAIN)
+        title_sim = similarity(title, yt_title)
+        score += title_sim * 45
+
+        # 2️⃣ Artist presence
+        if artist.lower() in yt_title_l:
             score += 25
-        if artist.lower() in channel:
+        if artist.lower() in channel_l:
             score += 20
-        if "topic" in channel or "vevo" in channel:
+
+        # 3️⃣ Trusted channels
+        if any(hint in channel_l for hint in TRUSTED_CHANNEL_HINTS):
             score += 15
 
+        # 4️⃣ Duration penalty (important)
         diff = abs(duration - target_duration)
-        if diff < 3:
+        if diff <= 3:
             score += 15
-        elif diff < 7:
-            score += 10
-        elif diff < 12:
-            score += 5
+        elif diff <= 7:
+            score += 8
+        elif diff <= 12:
+            score += 3
+        else:
+            score -= 20  # HARD penalty for wrong length
 
-        if views > 0:
-            score += min(15, views ** 0.25)
+        # 5️⃣ Popularity (small influence)
+        if views:
+            score += min(10, views ** 0.25)
+
+        # ❌ Reject weak matches
+        if title_sim < 0.45:
+            continue
 
         if score > best_score:
             best = e
             best_score = score
 
-    if not best and search.get("entries"):
-        best = search["entries"][0]
-
-    if not best:
+    # No confident match
+    if not best or best_score < 55:
         return None
 
     return {
@@ -107,83 +138,70 @@ class ImportReq(BaseModel):
     limit: int | None = None
 
 # =========================================================
-# 1️⃣ PREVIEW SPOTIFY PLAYLIST (FAST)
+# 1️⃣ PREVIEW SPOTIFY PLAYLIST
 # =========================================================
 @app.post("/preview-spotify")
 def preview_spotify(data: ImportReq):
     playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-
     playlist = sp.playlist(playlist_id)
 
-    name = playlist["name"]
-    owner = playlist["owner"]["display_name"]
-    total_tracks = playlist["tracks"]["total"]
-
-    # Calculate total duration
     total_duration_ms = 0
     offset = 0
-    batch = 100
 
     while True:
-        resp = sp.playlist_items(playlist_id, limit=batch, offset=offset)
+        resp = sp.playlist_items(playlist_id, limit=100, offset=offset)
         items = resp["items"]
         if not items:
             break
 
         for item in items:
-            track = item["track"]
-            if track:
-                total_duration_ms += track["duration_ms"]
+            if item["track"]:
+                total_duration_ms += item["track"]["duration_ms"]
 
-        offset += batch
+        offset += 100
 
-    total_minutes = total_duration_ms // 60000
-    hours = total_minutes // 60
-    minutes = total_minutes % 60
-
+    mins = total_duration_ms // 60000
     return {
         "playlist": {
             "id": playlist_id,
-            "name": name,
-            "owner": owner,
-            "total_tracks": total_tracks,
-            "duration": f"{hours} hr {minutes} min"
+            "name": playlist["name"],
+            "owner": playlist["owner"]["display_name"],
+            "total_tracks": playlist["tracks"]["total"],
+            "duration": f"{mins // 60} hr {mins % 60} min"
         }
     }
 
 # =========================================================
-# 2️⃣ IMPORT SPOTIFY PLAYLIST (HEAVY)
+# 2️⃣ IMPORT SPOTIFY PLAYLIST
 # =========================================================
 @app.post("/import-spotify")
 def import_spotify(data: ImportReq):
     playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-
     playlist_meta = sp.playlist(playlist_id)
-    playlist_name = playlist_meta["name"]
-    total_tracks = playlist_meta["tracks"]["total"]
 
-    # Fetch all tracks (pagination)
     tracks = []
     offset = 0
-    batch = 50
 
     while True:
-        resp = sp.playlist_items(playlist_id, limit=batch, offset=offset)
-        items = resp["items"]
-        if not items:
+        resp = sp.playlist_items(playlist_id, limit=50, offset=offset)
+        if not resp["items"]:
             break
-        tracks.extend(items)
-        offset += batch
+        tracks.extend(resp["items"])
+        offset += 50
 
     if data.limit:
         tracks = tracks[:data.limit]
 
     songs = []
-    processed = 0
+    skipped = {
+        "spotify_unavailable": 0,
+        "no_youtube_match": 0
+    }
 
     for item in tracks:
         track = item["track"]
         if not track:
+            skipped["spotify_unavailable"] += 1
             continue
 
         yt = best_youtube(
@@ -192,16 +210,22 @@ def import_spotify(data: ImportReq):
             track["duration_ms"] // 1000
         )
 
-        processed += 1
         if yt:
             songs.append(yt)
+        else:
+            skipped["no_youtube_match"] += 1
 
     return {
         "playlist": {
             "id": playlist_id,
-            "name": playlist_name,
-            "total_tracks": total_tracks
+            "name": playlist_meta["name"],
+            "total_tracks": playlist_meta["tracks"]["total"]
         },
-        "processed": processed,
+        "stats": {
+            "processed": len(tracks),
+            "imported": len(songs),
+            "skipped_spotify": skipped["spotify_unavailable"],
+            "skipped_youtube": skipped["no_youtube_match"]
+        },
         "songs": songs
     }
