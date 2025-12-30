@@ -10,7 +10,6 @@ import re
 
 app = FastAPI()
 
-# ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
