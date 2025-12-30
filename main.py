@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import yt_dlp
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
-from difflib import SequenceMatcher
+from rapidfuzz import fuzz
 import os
 import re
 
@@ -27,120 +27,170 @@ sp = spotipy.Spotify(
     )
 )
 
-# ---------- yt-dlp ----------
+# ---------- yt-dlp Configuration ----------
+# We fetch slightly more results (20) to ensure the official video is in the pool
 ydl_opts = {
     "quiet": True,
     "skip_download": True,
     "extract_flat": True,
-    "ignoreerrors": True
+    "ignoreerrors": True,
+    "noplaylist": True
 }
 
-BAD_KEYWORDS = [
-    "live", "remix", "cover", "karaoke", "slowed",
-    "reverb", "short", "instrumental", "8d", "nightcore"
+# Known "trash" keywords to filter out unless specifically requested
+BASE_BAD_KEYWORDS = [
+    "cover", "karaoke", "slowed", "reverb", "short",
+    "instrumental", "8d", "nightcore", "bass boosted", "reaction"
 ]
 
-TRUSTED_CHANNEL_HINTS = ["topic", "vevo", "official"]
+# Major labels that own rights to millions of songs (adds trust score)
+OFFICIAL_LABELS = [
+    "vevo", "topic", "official", "sony", "t-series", "zee", 
+    "warner", "universal", "monstercat", "record", "music", 
+    "entertainment", "audio"
+]
 
 # ---------- Utils ----------
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"\(.*?\)|\[.*?\]", "", text)
-    text = re.sub(r"[^a-z0-9\s]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
 
-def similarity(a, b):
-    return SequenceMatcher(None, normalize(a), normalize(b)).ratio()
+def clean_text(text: str) -> str:
+    """Normalize text for comparison."""
+    if not text: return ""
+    text = text.lower()
+    # Remove things inside brackets like (Official Video) for comparison, 
+    # but keep them if they contain 'remix' or 'live' to help identification
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def get_channel_trust_score(channel_name: str, artist_name: str) -> int:
+    """
+    Calculates how 'official' a channel looks.
+    """
+    channel_norm = channel_name.lower()
+    artist_norm = artist_name.lower()
+    score = 0
+
+    # 1. Immediate match: Artist name is IN the channel name (e.g., "Anirudh Ravichander")
+    if fuzz.partial_ratio(artist_norm, channel_norm) > 85:
+        score += 50
+
+    # 2. YouTube Auto-generated "Topic" channels (The Gold Standard)
+    # These are created by YouTube automatically from record label files.
+    if "topic" in channel_norm:
+        score += 40
+    
+    # 3. VEVO channels
+    if "vevo" in channel_norm:
+        score += 30
+
+    # 4. Known Record Labels (Sony, T-Series, etc.)
+    if any(label in channel_norm for label in OFFICIAL_LABELS):
+        score += 20
+        
+    return score
 
 def best_youtube(title, artist, target_duration):
-    query = f"{title} {artist}"
+    # 1. Construct a smarter query
+    # Adding "Official Audio" biases YouTube to show the real song first.
+    query = f"{title} {artist} Official Audio"
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        search = ydl.extract_info(
-            f"ytsearch15:{query}",
-            download=False
-        )
+        # Search for 15 videos
+        try:
+            search = ydl.extract_info(f"ytsearch15:{query}", download=False)
+        except Exception:
+            return None
 
-    strict_best = None
-    strict_score = -1
+    candidates = []
+    
+    # Pre-calculate normalized inputs
+    target_title_norm = clean_text(title)
+    target_artist_norm = clean_text(artist)
 
-    relaxed_best = None
-    relaxed_score = -1
+    # Dynamic Bad Keywords: 
+    # If the Spotify song IS a remix, we allow 'remix' in the YouTube title.
+    current_bad_keywords = [k for k in BASE_BAD_KEYWORDS if k not in target_title_norm]
 
     for e in search.get("entries", []):
-        if not e:
-            continue
+        if not e: continue
 
+        yt_id = e.get("id")
         yt_title = e.get("title") or ""
-        channel = e.get("uploader") or ""
-        duration = e.get("duration") or 0
-        views = e.get("view_count") or 0
+        yt_channel = e.get("uploader") or ""
+        yt_duration = e.get("duration") or 0
+        yt_views = e.get("view_count") or 0
+        
+        yt_title_norm = clean_text(yt_title)
+        yt_channel_norm = clean_text(yt_channel)
 
-        yt_title_l = yt_title.lower()
-        channel_l = channel.lower()
-
-        # ❌ Always reject obvious junk
-        if any(bad in yt_title_l for bad in BAD_KEYWORDS):
+        # ❌ STAGE 1: Hard Filters (Garbage Collection)
+        if any(bad in yt_title_norm for bad in current_bad_keywords):
+            continue
+            
+        # ❌ STAGE 2: Duration Sanity Check
+        # Official videos might have intros (+/- 20s is safe). 
+        # Topic videos are usually exact.
+        duration_diff = abs(yt_duration - target_duration)
+        if duration_diff > 45: # If duration is off by > 45s, it's likely wrong
             continue
 
-        title_sim = similarity(title, yt_title)
-
-        # -------------------
-        # STRICT SCORING
-        # -------------------
-        score = title_sim * 40
-
-        if artist.lower() in yt_title_l:
-            score += 25
-        if artist.lower() in channel_l:
+        # ✅ STAGE 3: Scoring Algorithm
+        score = 0
+        
+        # A. Title Similarity (0-100)
+        # token_set_ratio handles "Song Name - Artist" vs "Artist - Song Name" very well
+        title_score = fuzz.token_set_ratio(target_title_norm, yt_title_norm)
+        score += title_score * 2  # Weight: High
+        
+        # B. Channel / Artist Trust (0-100+)
+        channel_score = get_channel_trust_score(yt_channel, artist)
+        score += channel_score
+        
+        # C. Duration Precision
+        # If the duration is super close (<= 3s), it's likely the "Topic" audio
+        if duration_diff <= 3:
+            score += 30
+        elif duration_diff <= 10:
             score += 15
-        if any(h in channel_l for h in TRUSTED_CHANNEL_HINTS):
-            score += 10
+            
+        # D. View Count Logic (Logarithmic boost)
+        # We prefer high views, but 100M views isn't much better than 10M for identification.
+        # We just want to avoid the video with 5 views.
+        if yt_views > 1000000: score += 20
+        elif yt_views > 100000: score += 10
+        elif yt_views > 10000: score += 5
 
-        diff = abs(duration - target_duration)
-        if diff <= 5:
-            score += 15
-        elif diff <= 10:
-            score += 8
+        # E. Penalty for missing Artist name in Title/Channel
+        # If the artist name is nowhere to be found, punish heavily
+        if fuzz.partial_ratio(target_artist_norm, yt_title_norm) < 50 and \
+           fuzz.partial_ratio(target_artist_norm, yt_channel_norm) < 50:
+            score -= 50
 
-        if views:
-            score += min(10, views ** 0.25)
+        candidates.append({
+            "data": e,
+            "score": score,
+            "debug": { 
+                "title": yt_title, 
+                "channel": yt_channel, 
+                "diff": duration_diff,
+                "score": score 
+            }
+        })
 
-        if title_sim >= 0.45 and score > strict_score:
-            strict_best = e
-            strict_score = score
+    # Sort by score descending
+    candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        # -------------------
-        # RELAXED FALLBACK
-        # -------------------
-        relaxed = title_sim * 30
-
-        if artist.lower() in yt_title_l:
-            relaxed += 20
-        if artist.lower() in channel_l:
-            relaxed += 10
-
-        if views:
-            relaxed += min(10, views ** 0.25)
-
-        if title_sim >= 0.30 and relaxed > relaxed_score:
-            relaxed_best = e
-            relaxed_score = relaxed
-
-    best = strict_best or relaxed_best
-
-    if not best:
-        return None
-
-    return {
-        "id": best["id"],
-        "title": title,
-        "artist": best.get("uploader") or artist,
-        "sourceArtist": artist,
-        "duration": best.get("duration"),
-        "thumbnail": f"https://i.ytimg.com/vi/{best['id']}/hqdefault.jpg"
-    }
-
+    # Return the best match if it meets a minimum threshold
+    if candidates and candidates[0]["score"] > 140: # Threshold prevents completely wrong songs
+        best = candidates[0]["data"]
+        return {
+            "id": best["id"],
+            "title": title,
+            "artist": best.get("uploader") or artist,
+            "duration": best.get("duration"),
+            "thumbnail": f"https://i.ytimg.com/vi/{best['id']}/hqdefault.jpg"
+        }
+    
+    return None
 
 # ---------- Models ----------
 class ImportReq(BaseModel):
@@ -148,72 +198,40 @@ class ImportReq(BaseModel):
     limit: int | None = None
 
 # =========================================================
-# 1️⃣ PREVIEW SPOTIFY PLAYLIST
-# =========================================================
-@app.post("/preview-spotify")
-def preview_spotify(data: ImportReq):
-    playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-    playlist = sp.playlist(playlist_id)
-
-    total_duration_ms = 0
-    offset = 0
-
-    while True:
-        resp = sp.playlist_items(playlist_id, limit=100, offset=offset)
-        items = resp["items"]
-        if not items:
-            break
-
-        for item in items:
-            if item["track"]:
-                total_duration_ms += item["track"]["duration_ms"]
-
-        offset += 100
-
-    mins = total_duration_ms // 60000
-    return {
-        "playlist": {
-            "id": playlist_id,
-            "name": playlist["name"],
-            "owner": playlist["owner"]["display_name"],
-            "total_tracks": playlist["tracks"]["total"],
-            "duration": f"{mins // 60} hr {mins % 60} min"
-        }
-    }
-
-# =========================================================
 # 2️⃣ IMPORT SPOTIFY PLAYLIST
 # =========================================================
 @app.post("/import-spotify")
 def import_spotify(data: ImportReq):
-    playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-    playlist_meta = sp.playlist(playlist_id)
+    # Extract ID
+    try:
+        if "playlist/" in data.playlistUrl:
+            playlist_id = data.playlistUrl.split("playlist/")[1].split("?")[0]
+        else:
+            playlist_id = data.playlistUrl
+    except:
+        return {"error": "Invalid URL"}
 
+    playlist_meta = sp.playlist(playlist_id)
+    
     tracks = []
     offset = 0
-
+    # Fetch all tracks (simple pagination)
     while True:
         resp = sp.playlist_items(playlist_id, limit=50, offset=offset)
-        if not resp["items"]:
-            break
+        if not resp["items"]: break
         tracks.extend(resp["items"])
         offset += 50
-
-    if data.limit:
-        tracks = tracks[:data.limit]
+        if data.limit and len(tracks) >= data.limit:
+            tracks = tracks[:data.limit]
+            break
 
     songs = []
-    skipped = {
-        "spotify_unavailable": 0,
-        "no_youtube_match": 0
-    }
-
+    
     for item in tracks:
-        track = item["track"]
-        if not track:
-            skipped["spotify_unavailable"] += 1
-            continue
+        track = item.get("track")
+        if not track: continue
 
+        # --- Search ---
         yt = best_youtube(
             track["name"],
             track["artists"][0]["name"],
@@ -222,20 +240,15 @@ def import_spotify(data: ImportReq):
 
         if yt:
             songs.append(yt)
-        else:
-            skipped["no_youtube_match"] += 1
 
     return {
         "playlist": {
-            "id": playlist_id,
             "name": playlist_meta["name"],
             "total_tracks": playlist_meta["tracks"]["total"]
         },
-        "stats": {
-            "processed": len(tracks),
-            "imported": len(songs),
-            "skipped_spotify": skipped["spotify_unavailable"],
-            "skipped_youtube": skipped["no_youtube_match"]
-        },
         "songs": songs
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
