@@ -57,12 +57,15 @@ def best_youtube(title, artist, target_duration):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         search = ydl.extract_info(
-            f"ytsearch12:{query}",
+            f"ytsearch15:{query}",
             download=False
         )
 
-    best = None
-    best_score = -1
+    strict_best = None
+    strict_score = -1
+
+    relaxed_best = None
+    relaxed_score = -1
 
     for e in search.get("entries", []):
         if not e:
@@ -76,51 +79,57 @@ def best_youtube(title, artist, target_duration):
         yt_title_l = yt_title.lower()
         channel_l = channel.lower()
 
-        # ❌ Hard reject junk
+        # ❌ Always reject obvious junk
         if any(bad in yt_title_l for bad in BAD_KEYWORDS):
             continue
 
-        score = 0
-
-        # 1️⃣ Title similarity (MAIN)
         title_sim = similarity(title, yt_title)
-        score += title_sim * 45
 
-        # 2️⃣ Artist presence
+        # -------------------
+        # STRICT SCORING
+        # -------------------
+        score = title_sim * 40
+
         if artist.lower() in yt_title_l:
             score += 25
         if artist.lower() in channel_l:
-            score += 20
-
-        # 3️⃣ Trusted channels
-        if any(hint in channel_l for hint in TRUSTED_CHANNEL_HINTS):
             score += 15
+        if any(h in channel_l for h in TRUSTED_CHANNEL_HINTS):
+            score += 10
 
-        # 4️⃣ Duration penalty (important)
         diff = abs(duration - target_duration)
-        if diff <= 3:
+        if diff <= 5:
             score += 15
-        elif diff <= 7:
+        elif diff <= 10:
             score += 8
-        elif diff <= 12:
-            score += 3
-        else:
-            score -= 20  # HARD penalty for wrong length
 
-        # 5️⃣ Popularity (small influence)
         if views:
             score += min(10, views ** 0.25)
 
-        # ❌ Reject weak matches
-        if title_sim < 0.45:
-            continue
+        if title_sim >= 0.45 and score > strict_score:
+            strict_best = e
+            strict_score = score
 
-        if score > best_score:
-            best = e
-            best_score = score
+        # -------------------
+        # RELAXED FALLBACK
+        # -------------------
+        relaxed = title_sim * 30
 
-    # No confident match
-    if not best or best_score < 55:
+        if artist.lower() in yt_title_l:
+            relaxed += 20
+        if artist.lower() in channel_l:
+            relaxed += 10
+
+        if views:
+            relaxed += min(10, views ** 0.25)
+
+        if title_sim >= 0.30 and relaxed > relaxed_score:
+            relaxed_best = e
+            relaxed_score = relaxed
+
+    best = strict_best or relaxed_best
+
+    if not best:
         return None
 
     return {
@@ -131,6 +140,7 @@ def best_youtube(title, artist, target_duration):
         "duration": best.get("duration"),
         "thumbnail": f"https://i.ytimg.com/vi/{best['id']}/hqdefault.jpg"
     }
+
 
 # ---------- Models ----------
 class ImportReq(BaseModel):
