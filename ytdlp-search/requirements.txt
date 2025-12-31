@@ -1,3 +1,4 @@
+rapidfuzz
 fastapi
 uvicorn
 yt-dlp
