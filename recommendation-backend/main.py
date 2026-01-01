@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 # ---------- CONFIG ----------
-LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
+LASTFM_API_KEY = "7421c24f0ec3913d4b931779b627845a"
 
 ydl_opts = {
     "quiet": True,
