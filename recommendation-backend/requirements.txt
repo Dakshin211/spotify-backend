@@ -1,4 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 yt-dlp
 requests
+groq
+python-dotenv
