@@ -168,8 +168,8 @@ def preview_spotify(data: ImportReq):
     try:
         playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
         playlist = sp.playlist(playlist_id)
-    except:
-        return {"error": "Invalid Spotify URL"}
+    except Exception as e:
+        return {"error": str(e)}
 
     total_duration_ms = 0
     offset = 0
